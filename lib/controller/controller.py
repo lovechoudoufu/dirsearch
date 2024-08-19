@@ -162,7 +162,7 @@ class Controller:
                 )
                 exit(1)
 
-        if options["autosave_report"]:
+        if options["autosave_report"] and not options["output"] :
             self.report_path = options["output_path"] or FileUtils.build_path(
                 SCRIPT_PATH, "reports"
             )
@@ -574,7 +574,8 @@ class Controller:
 
         # Pass if path is in exclusive directories
         if any(
-            "/" + dir in path for dir in options["exclude_subdirs"]
+            path.startswith(dir) or "/" + dir in path
+            for dir in options["exclude_subdirs"]
         ):
             return
 
