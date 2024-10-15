@@ -169,6 +169,12 @@ def parse_arguments():
         help="Number of threads",
     )
     general.add_option(
+        "--async",
+        action="store_true",
+        dest="async_mode",
+        help="Enable asynchronous mode",
+    )
+    general.add_option(
         "-r",
         "--recursive",
         action="store_true",
@@ -458,7 +464,6 @@ def parse_arguments():
     )
     connection.add_option("--ip", action="store", dest="ip", help="Server IP address")
     connection.add_option("--interface", action="store", dest="network_interface", help="Network interface to use")
-
 
     # Advanced Settings
     advanced = OptionGroup(parser, "Advanced Settings")

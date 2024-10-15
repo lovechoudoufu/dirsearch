@@ -35,6 +35,9 @@ def parse_options():
     opt = parse_config(parse_arguments())
 
     if opt.session_file:
+        if opt.async_mode:
+            print("Cannot resume a session in asynchronous mode")
+            exit(1)
         return vars(opt)
 
     opt.http_method = opt.http_method.upper()
@@ -246,6 +249,7 @@ def parse_config(opt):
 
     # General
     opt.thread_count = opt.thread_count or config.safe_getint("general", "threads", 25)
+    opt.async_mode = opt.async_mode or config.safe_getboolean("general", "async")
     opt.include_status_codes = opt.include_status_codes or config.safe_get(
         "general", "include-status"
     )
