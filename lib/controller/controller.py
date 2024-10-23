@@ -16,6 +16,8 @@
 #
 #  Author: Mauro Soria
 
+from __future__ import annotations
+
 import asyncio
 import gc
 import os
@@ -24,14 +26,21 @@ import psycopg
 import re
 import time
 import mysql.connector
+try:
+    import cPickle as pickle
+except ModuleNotFoundError:
+    import pickle
 
 from urllib.parse import urlparse
 
 from lib.connection.dns import cache_dns
+from lib.connection.response import BaseResponse
 from lib.core.data import blacklists, options
 from lib.core.decorators import locked
 from lib.core.dictionary import Dictionary, get_blacklists
 from lib.core.exceptions import (
+    CannotConnectException,
+    FileExistsException,
     InvalidRawRequest,
     InvalidURLException,
     RequestException,
@@ -47,45 +56,26 @@ from lib.core.settings import (
     EXTENSION_RECOGNITION_REGEX,
     MAX_CONSECUTIVE_REQUEST_ERRORS,
     NEW_LINE,
-    SCRIPT_PATH,
     STANDARD_PORTS,
     UNKNOWN,
 )
 from lib.parse.rawrequest import parse_raw
 from lib.parse.url import clean_path, parse_path
-from lib.reports.csv_report import CSVReport
-from lib.reports.html_report import HTMLReport
-from lib.reports.json_report import JSONReport
-from lib.reports.markdown_report import MarkdownReport
-from lib.reports.mysql_report import MySQLReport
-from lib.reports.plain_text_report import PlainTextReport
-from lib.reports.postgresql_report import PostgreSQLReport
-from lib.reports.simple_report import SimpleReport
-from lib.reports.sqlite_report import SQLiteReport
-from lib.reports.xml_report import XMLReport
-from lib.utils.common import get_valid_filename, lstrip_once
+from lib.report.manager import ReportManager
+from lib.utils.common import lstrip_once
 from lib.utils.file import FileUtils
-from lib.utils.pickle import pickle, unpickle
 from lib.utils.schemedet import detect_scheme
 from lib.view.terminal import interface
 
-if options["async_mode"]:
-    from lib.connection.requester import AsyncRequester as Requester
-    from lib.core.fuzzer import AsyncFuzzer as Fuzzer
-
-    try:
-        import uvloop
-        asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
-    except ImportError:
-        pass
-else:
-    from lib.connection.requester import Requester
-    from lib.core.fuzzer import Fuzzer
-
 
 class Controller:
-    def __init__(self):
+    def __init__(self) -> None:
         if options["session_file"]:
+            print("WARNING: Running an untrusted session file might lead to unwanted code execution!")
+            interface.in_line("[c]continue / [q]uit: ")
+            if input() != "c":
+                exit(1)
+
             self._import(options["session_file"])
             self.old_session = True
         else:
@@ -94,10 +84,10 @@ class Controller:
 
         self.run()
 
-    def _import(self, session_file):
+    def _import(self, session_file: str) -> None:
         try:
             with open(session_file, "rb") as fd:
-                indict, last_output, opt = unpickle(fd)
+                dict_, last_output, opt = pickle.load(fd)
                 options.update(opt)
         except UnpicklingError:
             interface.error(
@@ -105,20 +95,24 @@ class Controller:
             )
             exit(1)
 
-        self.__dict__ = {**indict, **vars(self)}
+        self.__dict__ = {**dict_, **vars(self)}
         print(last_output)
 
-    def _export(self, session_file):
+    def _export(self, session_file: str) -> None:
         # Save written output
         last_output = interface.buffer.rstrip()
 
-        # Can't pickle Fuzzer class due to _thread.lock objects
-        del self.fuzzer
+        dict_ = vars(self).copy()
+        # Can't pickle some classes due to _thread.lock objects
+        dict_.pop("fuzzer", None)
+        dict_.pop("pause_future", None)
+        dict_.pop("loop", None)
+        dict_.pop("requester", None)
 
         with open(session_file, "wb") as fd:
-            pickle((vars(self), last_output, options), fd)
+            pickle.dump((dict_, last_output, options), fd)
 
-    def setup(self):
+    def setup(self) -> None:
         blacklists.update(get_blacklists())
 
         if options["raw_file"]:
@@ -141,31 +135,15 @@ class Controller:
             if options["cookie"]:
                 options["headers"]["cookie"] = options["cookie"]
 
-        self.requester = Requester()
         self.dictionary = Dictionary(files=options["wordlists"])
-        self.results = []
         self.start_time = time.time()
-        self.passed_urls = set()
-        self.directories = []
-        self.report = None
-        self.batch = False
+        self.passed_urls: set[str] = set()
+        self.directories: list[str] = []
         self.jobs_processed = 0
         self.errors = 0
         self.consecutive_errors = 0
 
-        if options["async_mode"]:
-            self.loop = asyncio.new_event_loop()
-            self.loop.add_signal_handler(signal.SIGINT, self.handle_pause)
-
-        if options["auth"]:
-            self.requester.set_auth(options["auth_type"], options["auth"])
-
-        if options["proxy_auth"]:
-            self.requester.set_proxy_auth(options["proxy_auth"])
-
         if options["log_file"]:
-            options["log_file"] = FileUtils.get_abs_path(options["log_file"])
-
             try:
                 FileUtils.create_dir(FileUtils.parent(options["log_file"]))
                 if not FileUtils.can_write(options["log_file"]):
@@ -179,27 +157,11 @@ class Controller:
                 )
                 exit(1)
 
-        if options["autosave_report"] and not options["output"]:
-            self.report_path = options["output_path"] or FileUtils.build_path(
-                SCRIPT_PATH, "reports"
-            )
-
-            try:
-                FileUtils.create_dir(self.report_path)
-                if not FileUtils.can_write(self.report_path):
-                    raise Exception
-
-            except Exception:
-                interface.error(
-                    f"Couldn't create report folder at {self.report_path}"
-                )
-                exit(1)
-
         interface.header(BANNER)
         interface.config(len(self.dictionary))
 
         try:
-            self.setup_reports()
+            self.reporter = ReportManager(options["output_formats"])
         except (
             InvalidURLException,
             mysql.connector.Error,
@@ -212,19 +174,37 @@ class Controller:
         if options["log_file"]:
             interface.log_file(options["log_file"])
 
-    def run(self):
+    def run(self) -> None:
+        if options["async_mode"]:
+            from lib.connection.requester import AsyncRequester as Requester
+            from lib.core.fuzzer import AsyncFuzzer as Fuzzer
+
+            try:
+                import uvloop
+                asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+            except ImportError:
+                pass
+        else:
+            from lib.connection.requester import Requester
+            from lib.core.fuzzer import Fuzzer
+
         # match_callbacks and not_found_callbacks callback values:
         #  - *args[0]: lib.connection.Response() object
         #
         # error_callbacks callback values:
         #  - *args[0]: exception
         match_callbacks = (
-            self.match_callback, self.reset_consecutive_errors
+            self.match_callback, self.reporter.save, self.reset_consecutive_errors
         )
         not_found_callbacks = (
             self.update_progress_bar, self.reset_consecutive_errors
         )
         error_callbacks = (self.raise_error, self.append_error_log)
+
+        self.requester = Requester()
+        if options["async_mode"]:
+            self.loop = asyncio.new_event_loop()
+            self.loop.add_signal_handler(signal.SIGINT, self.handle_pause)
 
         while options["urls"]:
             url = options["urls"][0]
@@ -246,9 +226,12 @@ class Controller:
                 if not self.old_session:
                     interface.target(self.url)
 
+                self.reporter.prepare(self.url)
                 self.start()
 
             except (
+                CannotConnectException,
+                FileExistsException,
                 InvalidURLException,
                 RequestException,
                 SkipTargetInterrupt,
@@ -261,6 +244,7 @@ class Controller:
                     interface.error(str(e))
 
             except QuitInterrupt as e:
+                self.reporter.finish()
                 interface.error(e.args[0])
                 exit(0)
 
@@ -268,6 +252,7 @@ class Controller:
                 options["urls"].pop(0)
 
         interface.warning("\nTask Completed")
+        self.reporter.finish()
 
         if options["session_file"]:
             try:
@@ -275,7 +260,7 @@ class Controller:
             except Exception:
                 interface.error("Failed to delete old session file, remove it to free some space")
 
-    def start(self):
+    def start(self) -> None:
         while self.directories:
             try:
                 gc.collect()
@@ -298,7 +283,7 @@ class Controller:
                     self.fuzzer.start()
                     self.process()
 
-            except KeyboardInterrupt:
+            except (KeyboardInterrupt, asyncio.CancelledError):
                 pass
 
             finally:
@@ -308,7 +293,7 @@ class Controller:
                 self.jobs_processed += 1
                 self.old_session = False
 
-    async def _start_coroutines(self):
+    async def _start_coroutines(self) -> None:
         task = self.loop.create_task(self.fuzzer.start())
 
         try:
@@ -328,7 +313,7 @@ class Controller:
 
         await task  # propagate the exception, if raised
 
-    def set_target(self, url):
+    def set_target(self, url: str) -> None:
         # If no scheme specified, unset it first
         if "://" not in url:
             url = f'{options["scheme"] or UNKNOWN}://{url}'
@@ -343,40 +328,33 @@ class Controller:
             cred, parsed.netloc = parsed.netloc.split("@")
             self.requester.set_auth("basic", cred)
 
-        host = parsed.netloc.split(":")[0]
-
         if parsed.scheme not in (UNKNOWN, "https", "http"):
             raise InvalidURLException(f"Unsupported URI scheme: {parsed.scheme}")
 
-        # If no port specified, set default (80, 443)
-        try:
-            port = int(parsed.netloc.split(":")[1])
-
-            if not 0 < port < 65536:
-                raise ValueError
-        except IndexError:
+        port = parsed.port
+        # If no port is specified, set default (80, 443) based on the scheme
+        if not port:
             port = STANDARD_PORTS.get(parsed.scheme, None)
-        except ValueError:
-            port = parsed.netloc.split(":")[1]
+        elif not 0 < port < 65536:
             raise InvalidURLException(f"Invalid port number: {port}")
 
         if options["ip"]:
-            cache_dns(host, port, options["ip"])
+            cache_dns(parsed.hostname, port, options["ip"])
 
         try:
             # If no scheme is found, detect it by port number
             scheme = (
                 parsed.scheme
                 if parsed.scheme != UNKNOWN
-                else detect_scheme(host, port)
+                else detect_scheme(parsed.hostname, port)
             )
         except ValueError:
             # If the user neither provides the port nor scheme, guess them based
             # on standard website characteristics
-            scheme = detect_scheme(host, 443)
+            scheme = detect_scheme(parsed.hostname, 443)
             port = STANDARD_PORTS[scheme]
 
-        self.url = f"{scheme}://{host}"
+        self.url = f"{scheme}://{parsed.hostname}"
 
         if port != STANDARD_PORTS[scheme]:
             self.url += f":{port}"
@@ -385,99 +363,10 @@ class Controller:
 
         self.requester.set_url(self.url)
 
-    def setup_batch_reports(self):
-        """Create batch report folder"""
-
-        self.batch = True
-        current_time = time.strftime("%y-%m-%d_%H-%M-%S")
-        batch_session = f"BATCH-{current_time}"
-        batch_directory_path = FileUtils.build_path(self.report_path, batch_session)
-
-        try:
-            FileUtils.create_dir(batch_directory_path)
-        except Exception:
-            interface.error(f"Couldn't create batch folder at {batch_directory_path}")
-            exit(1)
-
-        return batch_directory_path
-
-    def get_output_extension(self):
-        if options["output_format"] in ("plain", "simple"):
-            return "txt"
-
-        return options["output_format"]
-
-    def setup_reports(self):
-        """Create report file"""
-
-        output = options["output"]
-
-        if options["autosave_report"] and not output and options["output_format"] not in ("mysql", "postgresql"):
-            if len(options["urls"]) > 1:
-                directory_path = self.setup_batch_reports()
-                filename = "BATCH." + self.get_output_extension()
-            else:
-                self.set_target(options["urls"][0])
-
-                parsed = urlparse(self.url)
-
-                if not parsed.netloc:
-                    parsed = urlparse(f"//{options['urls'][0]}")
-
-                filename = get_valid_filename(f"{parsed.path}_")
-                filename += time.strftime("%y-%m-%d_%H-%M-%S")
-                filename += f".{self.get_output_extension()}"
-                directory_path = FileUtils.build_path(
-                    self.report_path, get_valid_filename(f"{parsed.scheme}_{parsed.netloc}")
-                )
-
-            output = FileUtils.get_abs_path((FileUtils.build_path(directory_path, filename)))
-
-            if FileUtils.exists(output):
-                i = 2
-                while FileUtils.exists(f"{output}_{i}"):
-                    i += 1
-
-                output += f"_{i}"
-
-            try:
-                FileUtils.create_dir(directory_path)
-            except Exception:
-                interface.error(
-                    f"Couldn't create the reports folder at {directory_path}"
-                )
-                exit(1)
-
-        if not output:
-            return
-
-        if options["output_format"] == "plain":
-            self.report = PlainTextReport(output)
-        elif options["output_format"] == "json":
-            self.report = JSONReport(output)
-        elif options["output_format"] == "xml":
-            self.report = XMLReport(output)
-        elif options["output_format"] == "md":
-            self.report = MarkdownReport(output)
-        elif options["output_format"] == "csv":
-            self.report = CSVReport(output)
-        elif options["output_format"] == "html":
-            self.report = HTMLReport(output)
-        elif options["output_format"] == "sqlite":
-            self.report = SQLiteReport(output)
-        elif options["output_format"] == "mysql":
-            self.report = MySQLReport(output)
-        elif options["output_format"] == "postgresql":
-            self.report = PostgreSQLReport(output)
-        else:
-            self.report = SimpleReport(output)
-
-        interface.output_location(output)
-
-    def reset_consecutive_errors(self, response):
+    def reset_consecutive_errors(self, response: BaseResponse) -> None:
         self.consecutive_errors = 0
 
-    def match_callback(self, response):
+    def match_callback(self, response: BaseResponse) -> None:
         if response.status in options["skip_on_status"]:
             raise SkipTargetInterrupt(
                 f"Skipped the target due to {response.status} status code"
@@ -511,11 +400,7 @@ class Controller:
             else:
                 self.requester.request(response.full_path, proxy=options["replay_proxy"])
 
-        if self.report:
-            self.results.append(response)
-            self.report.save(self.results)
-
-    def update_progress_bar(self, response):
+    def update_progress_bar(self, response: BaseResponse) -> None:
         jobs_count = (
             # Jobs left for unscanned targets
             len(options["subdirs"]) * (len(options["urls"]) - 1)
@@ -534,7 +419,7 @@ class Controller:
             self.errors,
         )
 
-    def raise_error(self, exception):
+    def raise_error(self, exception: RequestException) -> None:
         if options["exit_on_error"]:
             raise QuitInterrupt("Canceled due to an error")
 
@@ -544,10 +429,10 @@ class Controller:
         if self.consecutive_errors > MAX_CONSECUTIVE_REQUEST_ERRORS:
             raise SkipTargetInterrupt("Too many request errors")
 
-    def append_error_log(self, exception):
+    def append_error_log(self, exception: RequestException) -> None:
         logger.exception(exception)
 
-    def handle_pause(self):
+    def handle_pause(self) -> None:
         interface.warning(
             "CTRL+C detected: Pausing threads, please wait...", do_save=False
         )
@@ -567,14 +452,6 @@ class Controller:
             option = input()
 
             if option.lower() == "q":
-                if options["async_mode"]:
-                    quitexc = QuitInterrupt("Canceled by the user")
-                    if options["async_mode"]:
-                        self.pause_future.set_exception(quitexc)
-                        break
-                    else:
-                        raise quitexc
-
                 interface.in_line("[s]ave / [q]uit without saving: ")
 
                 option = input()
@@ -619,10 +496,10 @@ class Controller:
                 else:
                     raise skipexc
 
-    def is_timed_out(self):
+    def is_timed_out(self) -> bool:
         return time.time() - self.start_time > options["max_time"] > 0
 
-    def process(self):
+    def process(self) -> None:
         while True:
             try:
                 while not self.fuzzer.is_finished():
@@ -638,7 +515,7 @@ class Controller:
 
             time.sleep(0.3)
 
-    def add_directory(self, path):
+    def add_directory(self, path: str) -> None:
         """Add directory to the recursion queue"""
 
         # Pass if path is in exclusive directories
@@ -660,7 +537,7 @@ class Controller:
         self.passed_urls.add(url)
 
     @locked
-    def recur(self, path):
+    def recur(self, path: str) -> list[str]:
         dirs_count = len(self.directories)
         path = clean_path(path)
 
@@ -682,7 +559,7 @@ class Controller:
         # Return newly added directories
         return self.directories[dirs_count:]
 
-    def recur_for_redirect(self, path, redirect_path):
+    def recur_for_redirect(self, path: str, redirect_path: str) -> list[str]:
         if redirect_path == path + "/":
             return self.recur(redirect_path)
 

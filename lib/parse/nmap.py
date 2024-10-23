@@ -1,7 +1,9 @@
-import xml.etree.ElementTree as ET
+from __future__ import annotations
+
+import defusedxml.ElementTree as ET
 
 
-def parse_nmap(file):
+def parse_nmap(file: str) -> list[str]:
     root = ET.parse(file).getroot()
     targets = []
     for host in root.iter("host"):

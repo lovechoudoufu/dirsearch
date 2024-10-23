@@ -16,6 +16,8 @@
 #
 #  Author: Mauro Soria
 
+from __future__ import annotations
+
 import asyncio
 import http.client
 import random
@@ -24,7 +26,7 @@ import socket
 from ssl import SSLError
 import threading
 import time
-from typing import Generator, Optional
+from typing import Any, Generator
 from urllib.parse import urlparse
 
 import httpx
@@ -59,12 +61,12 @@ socket.getaddrinfo = cached_getaddrinfo
 
 
 class BaseRequester:
-    def __init__(self):
-        self._url = None
-        self._proxy_cred = None
+    def __init__(self) -> None:
+        self._url: str = ""
         self._rate = 0
+        self.proxy_cred = options["proxy_auth"]
         self.headers = CaseInsensitiveDict(options["headers"])
-        self.agents = []
+        self.agents: list[str] = []
         self.session = None
 
         self._cert = None
@@ -106,38 +108,35 @@ class BaseRequester:
         if not proxy.startswith(PROXY_SCHEMES):
             proxy = f"http://{proxy}"
 
-        if self._proxy_cred and "@" not in proxy:
+        if self.proxy_cred and "@" not in proxy:
             # socks5://localhost:9050 => socks5://[credential]@localhost:9050
-            proxy = proxy.replace("://", f"://{self._proxy_cred}@", 1)
+            proxy = proxy.replace("://", f"://{self.proxy_cred}@", 1)
 
         self.session.proxies = {"https": proxy}
         if not proxy.startswith("https://"):
             self.session.proxies["http"] = proxy
 
-    def set_proxy_auth(self, credential: str) -> None:
-        self._proxy_cred = credential
-
-    def is_rate_exceeded(self):
+    def is_rate_exceeded(self) -> bool:
         return self._rate >= options["max_rate"] > 0
 
-    def decrease_rate(self):
+    def decrease_rate(self) -> None:
         self._rate -= 1
 
-    def increase_rate(self):
+    def increase_rate(self) -> None:
         self._rate += 1
         threading.Timer(1, self.decrease_rate).start()
 
     @property
     @cached(RATE_UPDATE_DELAY)
-    def rate(self):
+    def rate(self) -> int:
         return self._rate
 
 
 class HTTPBearerAuth(AuthBase):
-    def __init__(self, token):
+    def __init__(self, token: str) -> None:
         self.token = token
 
-    def __call__(self, request):
+    def __call__(self, request: requests.PreparedRequest) -> requests.PreparedRequest:
         request.headers["Authorization"] = f"Bearer {self.token}"
         return request
 
@@ -160,7 +159,10 @@ class Requester(BaseRequester):
                 ),
             )
 
-    def set_auth(self, type, credential):
+        if options["auth"]:
+            self.set_auth(options["auth_type"], options["auth"])
+
+    def set_auth(self, type: str, credential: str) -> None:
         if type in ("bearer", "jwt"):
             self.session.auth = HTTPBearerAuth(credential)
         else:
@@ -178,7 +180,7 @@ class Requester(BaseRequester):
                 self.session.auth = HttpNtlmAuth(user, password)
 
     # :path: is expected not to start with "/"
-    def request(self, path, proxy=None):
+    def request(self, path: str, proxy: str | None = None) -> Response:
         # Pause if the request rate exceeded the maximum
         while self.is_rate_exceeded():
             time.sleep(0.1)
@@ -213,13 +215,13 @@ class Requester(BaseRequester):
                 prepped = self.session.prepare_request(request)
                 prepped.url = url
 
-                response = self.session.send(
+                origin_response = self.session.send(
                     prepped,
                     allow_redirects=options["follow_redirects"],
                     timeout=options["timeout"],
                     stream=True,
                 )
-                response = Response(response)
+                response = Response(origin_response)
 
                 log_msg = f'"{options["http_method"]} {response.url}" {response.status} - {response.length}B'
 
@@ -270,13 +272,13 @@ class HTTPXBearerAuth(httpx.Auth):
     def __init__(self, token: str) -> None:
         self.token = token
 
-    def auth_flow(self, request: httpx.Request) -> Generator:
+    def auth_flow(self, request: httpx.Request) -> Generator[httpx.Request, None, None]:
         request.headers["Authorization"] = f"Bearer {self.token}"
         yield request
 
 
 class ProxyRoatingTransport(httpx.AsyncBaseTransport):
-    def __init__(self, proxies, **kwargs) -> None:
+    def __init__(self, proxies: list[str], **kwargs: Any) -> None:
         self._transports = [
             httpx.AsyncHTTPTransport(proxy=proxy, **kwargs) for proxy in proxies
         ]
@@ -287,7 +289,7 @@ class ProxyRoatingTransport(httpx.AsyncBaseTransport):
 
 
 class AsyncRequester(BaseRequester):
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
 
         tpargs = {
@@ -310,6 +312,9 @@ class AsyncRequester(BaseRequester):
         )
         self.replay_session = None
 
+        if options["auth"]:
+            self.set_auth(options["auth_type"], options["auth"])
+
     def parse_proxy(self, proxy: str) -> str:
         if not proxy:
             return None
@@ -317,9 +322,9 @@ class AsyncRequester(BaseRequester):
         if not proxy.startswith(PROXY_SCHEMES):
             proxy = f"http://{proxy}"
 
-        if self._proxy_cred and "@" not in proxy:
+        if self.proxy_cred and "@" not in proxy:
             # socks5://localhost:9050 => socks5://[credential]@localhost:9050
-            proxy = proxy.replace("://", f"://{self._proxy_cred}@", 1)
+            proxy = proxy.replace("://", f"://{self.proxy_cred}@", 1)
 
         return proxy
 
@@ -340,7 +345,7 @@ class AsyncRequester(BaseRequester):
             else:
                 self.session.auth = HttpxNtlmAuth(user, password)
 
-    async def replay_request(self, path: str, proxy: str):
+    async def replay_request(self, path: str, proxy: str) -> AsyncResponse:
         if self.replay_session is None:
             transport = httpx.AsyncHTTPTransport(
                 verify=False,
@@ -357,7 +362,7 @@ class AsyncRequester(BaseRequester):
 
     # :path: is expected not to start with "/"
     async def request(
-        self, path: str, session: Optional[httpx.AsyncClient] = None
+        self, path: str, session: httpx.AsyncClient | None = None
     ) -> AsyncResponse:
         while self.is_rate_exceeded():
             await asyncio.sleep(0.1)
