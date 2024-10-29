@@ -69,9 +69,9 @@ PROXY_SCHEMES = ("http://", "https://", "socks5://", "socks5h://", "socks4://", 
 
 STANDARD_PORTS = {"http": 80, "https": 443}
 
-DEFAULT_TEST_PREFIXES = (".",)
+DEFAULT_TEST_PREFIXES = (".", ".ht")
 
-DEFAULT_TEST_SUFFIXES = ("/",)
+DEFAULT_TEST_SUFFIXES = ("/", "~")
 
 DEFAULT_TOR_PROXIES = ("socks5://127.0.0.1:9050", "socks5://127.0.0.1:9150")
 
@@ -114,8 +114,6 @@ DUMMY_WORD = "dummyasdf"
 SOCKET_TIMEOUT = 6
 
 RATE_UPDATE_DELAY = 0.15
-
-MAX_MATCH_RATIO = 0.98
 
 ITER_CHUNK_SIZE = 1024 * 1024
 
